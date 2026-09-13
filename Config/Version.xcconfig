@@ -3,4 +3,4 @@
 // below. Never in project.pbxproj: MARKETING_VERSION appears there once per
 // configuration and target, so a target added later would silently keep the old
 // version while the release claims the new one.
-MARKETING_VERSION = 0.1.0 // x-release-please-version
+MARKETING_VERSION = 0.2.0 // x-release-please-version
