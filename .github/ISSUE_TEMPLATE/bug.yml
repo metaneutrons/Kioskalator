@@ -1,0 +1,53 @@
+name: Bug report
+description: Something behaves differently than documented.
+labels: [bug]
+body:
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: What you saw, and what you expected instead.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: How to reproduce
+      description: Steps, and the configuration in force. Redact URLs and passcodes.
+      placeholder: |
+        1. Configuration: …
+        2. Launch Kioskalator
+        3. …
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Kioskalator version
+      description: From the settings pane, or `defaults read <app>/Contents/Info CFBundleShortVersionString`.
+    validations:
+      required: true
+  - type: input
+    id: macos
+    attributes:
+      label: macOS version
+    validations:
+      required: true
+  - type: dropdown
+    id: config-source
+    attributes:
+      label: Where does the configuration come from
+      options:
+        - Managed preferences (MDM configuration profile)
+        - Local configuration file
+        - Remote configuration URL
+        - In-app settings
+        - Defaults only
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Log output
+      description: '`log show --predicate ''subsystem == "cc.metaneutrons.Kioskalator"'' --last 10m`'
+      render: text

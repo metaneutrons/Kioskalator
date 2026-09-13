@@ -1,0 +1,44 @@
+# lefthook for Kioskalator.
+#   brew install lefthook
+#   lefthook install
+# The scripts under scripts/hooks/ are manager-independent.
+
+commit-msg:
+  commands:
+    conventional-commits:
+      run: sh scripts/hooks/check-commit-message.sh {1}
+
+pre-commit:
+  parallel: true
+  commands:
+    staged-guards:
+      run: sh scripts/hooks/check-staged.sh
+    secrets:
+      run: gitleaks git --pre-commit --redact --staged --verbose
+    # swift-format comes from the toolchain, so there is nothing to install and
+    # nothing to pin; it cannot drift from the compiler.
+    format:
+      glob: '*.swift'
+      run: xcrun swift-format lint --strict {staged_files}
+    # Affordable on staged files only. Never the whole tree here.
+    lint:
+      glob: '*.swift'
+      run: swiftlint lint --strict --quiet {staged_files}
+    # project.yml is the only source of the Xcode project, so a spec that does
+    # not parse breaks every clone. Sub-second, unlike a build.
+    project-spec:
+      glob: 'project.yml'
+      run: xcodegen generate --quiet
+
+pre-push:
+  parallel: false
+  commands:
+    secrets:
+      run: sh scripts/hooks/check-push-secrets.sh
+    # xcodebuild is deliberately absent from BOTH phases. A clean app build runs
+    # into minutes, the hook then gets bypassed with --no-verify, and that also
+    # skips the commit-message check. The build belongs in CI.
+    # The package tests are sub-second, measured, so they stay on.
+    tests:
+      run: swift test --disable-automatic-resolution
+      root: Core/

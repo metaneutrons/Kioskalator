@@ -1,0 +1,6 @@
+// The single place the release version lives. Every build configuration reads
+// MARKETING_VERSION from here, and release-please raises it through the marker
+// below. Never in project.pbxproj: MARKETING_VERSION appears there once per
+// configuration and target, so a target added later would silently keep the old
+// version while the release claims the new one.
+MARKETING_VERSION = 0.1.0 // x-release-please-version

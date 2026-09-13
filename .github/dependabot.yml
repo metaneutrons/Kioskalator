@@ -1,0 +1,45 @@
+# Only the ecosystems this repository actually has. Swift is a first-class
+# value and needs no enable-beta-ecosystems.
+#
+# Known limitation, recorded rather than assumed away: Dependabot's Swift
+# support reads Package.swift and Package.resolved. This repository keeps both
+# in Core/ and declares that manifest authoritative for the dependency graph
+# exactly so that this entry has something to read. The Xcode project holds no
+# package references of its own. Whether Dependabot finds anything is checked
+# after the first run; nothing found is a gap to write down, not a clean bill
+# of health.
+
+version: 2
+
+updates:
+  - package-ecosystem: swift
+    directory: /Core
+    schedule:
+      interval: weekly
+      day: monday
+      time: '05:00'
+    open-pull-requests-limit: 5
+    cooldown:
+      default-days: 3
+      semver-major-days: 7
+    groups:
+      swift-minor-patch:
+        patterns: ['*']
+        update-types: [minor, patch]
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: '05:15'
+    open-pull-requests-limit: 5
+    cooldown:
+      default-days: 3
+      # semver-major-days is not permitted for github-actions. If it stands
+      # here, Dependabot rejects the ENTIRE file and not a single update runs
+      # any more, not even a security update.
+    groups:
+      github-actions-minor-patch:
+        patterns: ['*']
+        update-types: [minor, patch]

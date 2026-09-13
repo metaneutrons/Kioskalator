@@ -1,0 +1,31 @@
+name: Feature request
+description: Something Kioskalator should be able to do.
+labels: [enhancement]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: The deployment problem
+      description: What does the kiosk have to do that it cannot do today.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposal
+    validations:
+      required: true
+  - type: dropdown
+    id: lockable
+    attributes:
+      label: Should this be lockable by an administrator
+      options:
+        - 'Yes, it changes what the kiosk permits'
+        - 'No, it is cosmetic or per-installation'
+        - Unsure
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: What you considered instead

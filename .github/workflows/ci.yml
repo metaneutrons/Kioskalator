@@ -1,0 +1,221 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # runs-on: macos-26 pins nothing. The image carries several Xcode versions and
+  # decides which is selected; DEVELOPER_DIR is the pin and the assertion below
+  # is what makes it one.
+  DEVELOPER_DIR: /Applications/Xcode_26.6.app/Contents/Developer
+  XCODE_VERSION: '26.6'
+  SCHEME: Kioskalator
+  COVERAGE_FLOOR: '70'
+  SWIFTLINT_VERSION: '0.65.1'
+  LEFTHOOK_VERSION: '2.1.12'
+  XCODEGEN_VERSION: '2.46.0'
+
+jobs:
+  quality:
+    name: Format and lint
+    runs-on: macos-26
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: The toolchain has to be the pinned one
+        run: |
+          set -euo pipefail
+          ls -d /Applications/Xcode*.app
+          xcodebuild -version
+          swift --version
+          test "$(xcodebuild -version | awk 'NR==1{print $2}')" = "$XCODE_VERSION"
+
+      # swift-format comes from the toolchain: nothing to install, nothing to
+      # pin, and it cannot drift from the compiler.
+      - run: xcrun swift-format lint --strict --recursive App Core/Sources Core/Tests
+
+      - name: SwiftLint, version pinned like any other dependency
+        run: |
+          set -euo pipefail
+          curl -sSfL -o "$RUNNER_TEMP/swiftlint.zip" \
+            "https://github.com/realm/SwiftLint/releases/download/${SWIFTLINT_VERSION}/portable_swiftlint.zip"
+          unzip -q -o "$RUNNER_TEMP/swiftlint.zip" -d "$RUNNER_TEMP/swiftlint"
+          "$RUNNER_TEMP/swiftlint/swiftlint" version
+          "$RUNNER_TEMP/swiftlint/swiftlint" lint --strict
+
+      - name: Check the hook configuration
+        run: |
+          set -euo pipefail
+          curl -sSfL \
+            "https://github.com/evilmartians/lefthook/releases/download/v${LEFTHOOK_VERSION}/lefthook_${LEFTHOOK_VERSION}_MacOS_arm64.gz" \
+            | gzip -d > "$RUNNER_TEMP/lefthook"
+          chmod +x "$RUNNER_TEMP/lefthook"
+          "$RUNNER_TEMP/lefthook" validate
+
+  test:
+    name: Build and test
+    runs-on: macos-26
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: The toolchain has to be the pinned one
+        run: |
+          set -euo pipefail
+          test "$(xcodebuild -version | awk 'NR==1{print $2}')" = "$XCODE_VERSION"
+
+      # Swift has no --fail-under-lines. A printed percentage is not a floor; the
+      # exit code of this script is. It asserts a unique test bundle before it
+      # measures anything.
+      - name: Package tests with a hard coverage floor
+        run: scripts/check-coverage.sh "$COVERAGE_FLOOR"
+
+      - name: Generate the Xcode project from its spec
+        run: |
+          set -euo pipefail
+          curl -sSfL -o "$RUNNER_TEMP/xcodegen.zip" \
+            "https://github.com/yonaskolb/XcodeGen/releases/download/${XCODEGEN_VERSION}/xcodegen.zip"
+          unzip -q -o "$RUNNER_TEMP/xcodegen.zip" -d "$RUNNER_TEMP"
+          "$RUNNER_TEMP/xcodegen/bin/xcodegen" --version
+          "$RUNNER_TEMP/xcodegen/bin/xcodegen" generate --quiet
+
+      # Core/Package.resolved is the lockfile. xcodebuild otherwise resolves from
+      # the network and the committed lockfile describes nothing, so it is seeded
+      # into the generated project before the build and the build is told to use
+      # only what it names.
+      - name: Seed the generated project with the committed lockfile
+        run: |
+          set -euo pipefail
+          seed=Kioskalator.xcodeproj/project.xcworkspace/xcshareddata/swiftpm
+          if [ -f Core/Package.resolved ]; then
+            mkdir -p "$seed"
+            cp Core/Package.resolved "$seed/Package.resolved"
+            echo "seeded $seed/Package.resolved"
+          else
+            # No external dependency yet, so there is no lockfile to seed. As
+            # soon as one is added this branch stops being taken, and the guard
+            # below is what makes that visible rather than silent.
+            if [ -f "$seed/Package.resolved" ]; then
+              echo "::error::the project resolved packages but Core/Package.resolved is absent"
+              exit 1
+            fi
+            echo "no external dependencies; nothing to seed"
+          fi
+
+      - name: The named scheme has to be shared
+        run: |
+          set -euo pipefail
+          xcodebuild -list -project Kioskalator.xcodeproj | grep -qx "        ${SCHEME}" \
+            || { echo "::error::scheme ${SCHEME} is not shared"; exit 1; }
+
+      # Warnings as errors on the command line, never in the project file: baked
+      # in it makes every local build hostile and invites a blanket disable.
+      - name: Build the application
+        run: |
+          set -euo pipefail
+          xcodebuild build -quiet \
+            -scheme "$SCHEME" \
+            -destination 'platform=macOS,arch=arm64' \
+            -derivedDataPath build \
+            -onlyUsePackageVersionsFromResolvedFile \
+            SWIFT_TREAT_WARNINGS_AS_ERRORS=YES
+
+      # A path from /opt/homebrew, /usr/local, /Users or /Volumes means a build
+      # machine dependency travelled into the artefact and the application would
+      # fail to launch on a clean machine rather than here.
+      - name: The binary must not link anything off this machine
+        run: |
+          set -euo pipefail
+          binary=build/Build/Products/Debug/Kioskalator.app/Contents/MacOS/Kioskalator
+          otool -L "$binary"
+          if otool -L "$binary" | grep -Eq '/opt/homebrew|/usr/local|/Users/|/Volumes/'; then
+            echo "::error::the binary links against a path from the build machine"
+            exit 1
+          fi
+
+  commit-hygiene:
+    name: Commit hygiene
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - name: Check title, body and every commit
+        # Title and body reach the script exclusively through env, never by
+        # interpolation into the script text: otherwise the pull request title
+        # would be a shell injection vector.
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          PR_BODY: ${{ github.event.pull_request.body }}
+        run: |
+          set -euo pipefail
+          status=0
+          cc='^((feat|fix|docs|style|refactor|perf|test|build|ci|chore|revert)(\([a-z0-9._/-]+\))?!?: .+|Revert ".+")'
+          ban='^[[:space:]]*co-authored-by:.*(claude|anthropic)|^[[:space:]]*generated with.*claude code'
+
+          # On a squash merge the pull request title becomes the subject line on
+          # main and thereby determines the next version.
+          if ! printf '%s' "$PR_TITLE" | grep -Eq "$cc"; then
+            echo "::error::pull request title does not follow Conventional Commits: $PR_TITLE"
+            status=1
+          fi
+
+          # With squash_merge_commit_message=PR_BODY the body lands in the commit.
+          if printf '%s' "$PR_BODY" | grep -Eiq "$ban"; then
+            echo "::error::the pull request body contains an AI attribution trailer."
+            status=1
+          fi
+
+          for sha in $(git rev-list "${BASE_SHA}..${HEAD_SHA}"); do
+            if git log -1 --format=%B "$sha" | grep -Eiq "$ban"; then
+              echo "::error::commit $sha contains an AI attribution trailer."
+              status=1
+            fi
+            email=$(git log -1 --format='%ae%n%ce' "$sha")
+            if printf '%s' "$email" | grep -Fq 'noreply@anthropic.com'; then
+              echo "::error::commit $sha has an Anthropic address as author or committer."
+              status=1
+            fi
+          done
+
+          exit "$status"
+
+  secrets:
+    name: Secret scan
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      # The pre-push hook scans only the new commits. The full scan over the
+      # history belongs here.
+      - uses: gitleaks/gitleaks-action@e0c47f4f8be36e29cdc102c57e68cb5cbf0e8d1e # v3.0.0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITLEAKS_LICENSE: ${{ secrets.GITLEAKS_LICENSE }}
+
+  # The only required check in the ruleset. Matrix changes therefore do not break
+  # the repository configuration.
+  ci-success:
+    name: CI Success
+    if: always()
+    needs: [quality, test, secrets, commit-hygiene]
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Every preceding job must have succeeded or been skipped
+        run: |
+          set -euo pipefail
+          printf '%s\n' '${{ toJSON(needs) }}' |
+            jq -e 'all(.[]; .result == "success" or .result == "skipped")'

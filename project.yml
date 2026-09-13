@@ -1,0 +1,77 @@
+name: Kioskalator
+
+options:
+  bundleIdPrefix: com.metaneutrons
+  deploymentTarget:
+    macOS: '26.0'
+  createIntermediateGroups: true
+  minimumXcodeGenVersion: '2.42.0'
+
+configFiles:
+  Debug: Config/Shared.xcconfig
+  Release: Config/Shared.xcconfig
+
+packages:
+  KioskCore:
+    path: Core
+
+targets:
+  Kioskalator:
+    type: application
+    platform: macOS
+    sources:
+      - path: App
+    dependencies:
+      - package: KioskCore
+        product: KioskCore
+    entitlements:
+      path: App/Kioskalator.entitlements
+      properties:
+        # Deliberately not sandboxed. The kiosk presentation options that hide
+        # the Dock and menu bar and disable process switching are unavailable to
+        # a sandboxed application, and reading a machine-wide configuration file
+        # under /Library is too. This ships through Developer ID, not the App
+        # Store, so the sandbox is not required either.
+        com.apple.security.app-sandbox: false
+        com.apple.security.cs.allow-jit: true
+    info:
+      path: App/Info.plist
+      properties:
+        CFBundleName: Kioskalator
+        CFBundleDisplayName: Kioskalator
+        CFBundleShortVersionString: $(MARKETING_VERSION)
+        CFBundleVersion: $(CURRENT_PROJECT_VERSION)
+        CFBundlePackageType: APPL
+        LSMinimumSystemVersion: $(MACOSX_DEPLOYMENT_TARGET)
+        LSApplicationCategoryType: public.app-category.utilities
+        NSHighResolutionCapable: true
+        # A kiosk has no Dock icon to click and no menu bar to read. The
+        # application still runs as a regular application so its windows can
+        # take key focus; the Dock is hidden through the presentation options
+        # instead, which is reversible when the kiosk is unlocked.
+        NSSupportsAutomaticTermination: false
+        NSSupportsSuddenTermination: false
+        NSHumanReadableCopyright: Copyright (C) 2026 Fabian Schmieder. GPL-3.0-or-later.
+        NSCameraUsageDescription: A page shown by this kiosk asked to use the camera.
+        NSMicrophoneUsageDescription: A page shown by this kiosk asked to use the microphone.
+        NSLocationWhenInUseUsageDescription: A page shown by this kiosk asked for the location.
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.metaneutrons.kioskalator
+        PRODUCT_NAME: Kioskalator
+        INFOPLIST_KEY_NSPrincipalClass: NSApplication
+        CODE_SIGN_IDENTITY: '-'
+        SWIFT_EMIT_LOC_STRINGS: NO
+      configs:
+        Release:
+          SWIFT_COMPILATION_MODE: wholemodule
+
+schemes:
+  Kioskalator:
+    build:
+      targets:
+        Kioskalator: all
+    run:
+      config: Debug
+    archive:
+      config: Release

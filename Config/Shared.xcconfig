@@ -1,0 +1,25 @@
+#include "Version.xcconfig"
+
+// Swift 6 language mode makes a data race a compile error instead of a fault in
+// production. Complete concurrency checking is the point of adopting it at all.
+SWIFT_VERSION = 6.0
+SWIFT_STRICT_CONCURRENCY = complete
+SWIFT_UPCOMING_FEATURE_EXISTENTIAL_ANY = YES
+
+MACOSX_DEPLOYMENT_TARGET = 26.0
+ARCHS = $(ARCHS_STANDARD)
+
+// Warnings as errors belongs on the CI command line, not here. Baked into the
+// project it makes every local build hostile during ordinary work, and the
+// predictable reaction is a blanket disable that then also silences CI.
+GCC_TREAT_WARNINGS_AS_ERRORS = NO
+
+CLANG_ENABLE_MODULES = YES
+ENABLE_HARDENED_RUNTIME = YES
+CODE_SIGN_STYLE = Manual
+DEAD_CODE_STRIPPING = YES
+
+// The build number is not the release version and is not managed by
+// release-please. CI overrides it with something monotonic; two builds sharing
+// one are rejected on upload and confuse an update feed's comparison.
+CURRENT_PROJECT_VERSION = 1
