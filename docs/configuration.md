@@ -16,7 +16,7 @@ first layer that supplies a value wins:
 | 1 | Managed preferences | A configuration profile pushed by MDM, read through `CFPreferencesAppValueIsForced` | Jamf, Intune, Mosyle, or a profile installed by hand |
 | 2 | Remote configuration | JSON fetched from `remoteConfigurationURL`, signature checked | Whoever operates the fleet endpoint |
 | 3 | Local file | `/Library/Application Support/Kioskalator/configuration.json` | An administrator with root, Ansible, a provisioning script |
-| 4 | In-app settings | The settings pane behind the exit passcode, stored in the user domain | The person on site |
+| 4 | In-app settings | The user defaults of the application, read by the resolver; the settings pane that writes them is [#3](https://github.com/metaneutrons/Kioskalator/issues/3) | The person on site |
 
 Below all four sits the built-in default. A key with no value anywhere resolves
 to its default, and the resolver reports the origin as `default` so the settings
@@ -49,9 +49,12 @@ alternative fails in practice:
 - **A lock can be declared without a value.** `"locked": ["homeURL"]` with no
   `homeURL` freezes whatever the layers below already resolved to. That lets a
   profile pin a per-machine value it does not itself know.
-- **The settings pane shows the origin of every key**, and greys a locked field
-  with the name of the layer holding it. An administrator on site can then see
-  why a field will not take, instead of concluding the application is broken.
+- **The settings pane shows the origin of every key** and which layer holds its
+  lock. An administrator on site can then see why a value is what it is, instead
+  of concluding the application is broken. The pane is **read-only today**:
+  layer 4 exists in the resolver and in `ConfigurationStore.write(_:for:)`, and
+  the editing surface on top of it is
+  [#3](https://github.com/metaneutrons/Kioskalator/issues/3).
 
 A key can also be locked *empty*, which is how a capability is taken away
 rather than configured: `"allowFileUploads": false` plus a lock on it means no
@@ -60,8 +63,10 @@ layer below, and no person at the keyboard, can turn uploads back on.
 ## Keys
 
 Status column: **live** is implemented and tested; **planned** is specified here
-and tracked as an issue, and the resolver rejects it as unknown until it lands.
-Nothing in this table is claimed to work before it does.
+and tracked as the linked issue, and the resolver rejects it as an unknown key
+until it lands. Nothing in this table is claimed to work before it does, and a
+planned key in a configuration document is reported as a defect rather than
+ignored.
 
 ### Content
 
@@ -71,8 +76,8 @@ Nothing in this table is claimed to work before it does.
 | `userAgent` | string | system | live | Replaces the WKWebView user agent, so the served site can detect the kiosk. |
 | `injectedStyleSheets` | [string] | `[]` | live | CSS injected at document start, one entry per stylesheet. |
 | `injectedUserScripts` | [object] | `[]` | live | JavaScript injected at `documentStart` or `documentEnd`. Each entry is `{source, injectionTime, mainFrameOnly}`. |
-| `nativeBridgeEnabled` | bool | `false` | planned | Exposes a `WKScriptMessageHandler` to the page. |
-| `nativeBridgeAllowedOrigins` | [string] | `[]` | planned | Origins the bridge answers. An empty list with the bridge on is a configuration error, not an open door. |
+| `nativeBridgeEnabled` | bool | `false` | [planned](https://github.com/metaneutrons/Kioskalator/issues/5) | Exposes a `WKScriptMessageHandler` to the page. |
+| `nativeBridgeAllowedOrigins` | [string] | `[]` | [planned](https://github.com/metaneutrons/Kioskalator/issues/5) | Origins the bridge answers. An empty list with the bridge on is a configuration error, not an open door. |
 
 `injectedUserScripts` is code execution inside the kiosk's browsing context. It
 is a key an MDM profile should normally lock, so that a passcode holder on site
@@ -87,7 +92,7 @@ cannot add a script; the settings pane will not offer it while it is locked.
 | `externalSchemePolicy` | enum | `block` | live | What happens to `mailto:`, `tel:` and other non-http schemes. `block` or `openInDefaultApplication`. |
 | `allowDownloads` | bool | `false` | live | Downloads are refused by default; a download on a kiosk is a file on a machine nobody administers. |
 | `allowFileUploads` | bool | `false` | live | Whether a file input may open a picker at all. |
-| `fileUploadDirectory` | path | none | planned | Restricts the picker to one directory. Without it an upload picker is a file browser, and a file browser is an escape route. |
+| `fileUploadDirectory` | path | none | [planned](https://github.com/metaneutrons/Kioskalator/issues/10) | Restricts the picker to one directory. Without it an upload picker is a file browser, and a file browser is an escape route. |
 
 **Pattern syntax.** A pattern is `host/path-prefix`, where the host may carry a
 leading `*.` for one level of subdomain wildcard and the path may end in `*`.
@@ -134,7 +139,7 @@ it is a sensible default.
 | `preventSleep` | bool | `true` | live | Holds a power assertion so the display does not sleep under the kiosk. |
 | `scheduledReloadInterval` | seconds | `0` | live | Periodic reload, against single-page applications that leak. `0` is off. |
 | `scheduledRestartTime` | `HH:mm` | none | live | Relaunch the application at a fixed local time. |
-| `displaySchedule` | [object] | `[]` | planned | Blank and wake the screen on a weekday schedule. |
+| `displaySchedule` | [object] | `[]` | [planned](https://github.com/metaneutrons/Kioskalator/issues/9) | Blank and wake the screen on a weekday schedule. |
 
 ### Administration
 
@@ -167,35 +172,53 @@ who has to decide that is usually on the phone.
 
 | Key | Type | Default | Status | What it does |
 | --- | --- | --- | --- | --- |
-| `clientCertificateIdentity` | string | none | planned | Keychain label of the identity used for mTLS. |
-| `pinnedCertificateSHA256` | [string] | `[]` | planned | Accept a private CA or a self-signed certificate by fingerprint. Deliberately not a switch that accepts everything. |
-| `basicAuthCredentialReference` | object | `{}` | planned | Keychain reference per host. The password goes in the Keychain, never in the configuration document. |
-| `proxyConfiguration` | object | none | planned | Per-application proxy, rather than a system-wide one. |
+| `clientCertificateIdentity` | string | none | [planned](https://github.com/metaneutrons/Kioskalator/issues/6) | Keychain label of the identity used for mTLS. |
+| `pinnedCertificateSHA256` | [string] | `[]` | [planned](https://github.com/metaneutrons/Kioskalator/issues/6) | Accept a private CA or a self-signed certificate by fingerprint. Deliberately not a switch that accepts everything. |
+| `basicAuthCredentialReference` | object | `{}` | [planned](https://github.com/metaneutrons/Kioskalator/issues/6) | Keychain reference per host. The password goes in the Keychain, never in the configuration document. |
+| `proxyConfiguration` | object | none | [planned](https://github.com/metaneutrons/Kioskalator/issues/6) | Per-application proxy, rather than a system-wide one. |
 
 ### Remote management
 
 | Key | Type | Default | Status | What it does |
 | --- | --- | --- | --- | --- |
-| `controlAPIEnabled` | bool | `false` | planned | A loopback-bound HTTP API: status, reload, navigate, reset, reconfigure. |
-| `controlAPIPort` | int | `8377` | planned | Its port. Bound to `127.0.0.1` only, never to a routable address. |
-| `controlAPITokenReference` | string | none | planned | Keychain reference for the bearer token. Enabling the API without a token is a configuration error. |
-| `mqttEnabled` | bool | `false` | planned | Publish health and subscribe to commands. |
-| `mqttBrokerURL` | URL | none | planned | Broker endpoint. |
-| `mqttBaseTopic` | string | `kioskalator` | planned | Topic prefix; the kiosk identifier is appended. |
-| `mqttCredentialReference` | string | none | planned | Keychain reference for broker credentials. |
+| `controlAPIEnabled` | bool | `false` | [planned](https://github.com/metaneutrons/Kioskalator/issues/7) | A loopback-bound HTTP API: status, reload, navigate, reset, reconfigure. |
+| `controlAPIPort` | int | `8377` | [planned](https://github.com/metaneutrons/Kioskalator/issues/7) | Its port. Bound to `127.0.0.1` only, never to a routable address. |
+| `controlAPITokenReference` | string | none | [planned](https://github.com/metaneutrons/Kioskalator/issues/7) | Keychain reference for the bearer token. Enabling the API without a token is a configuration error. |
+| `mqttEnabled` | bool | `false` | [planned](https://github.com/metaneutrons/Kioskalator/issues/8) | Publish health and subscribe to commands. |
+| `mqttBrokerURL` | URL | none | [planned](https://github.com/metaneutrons/Kioskalator/issues/8) | Broker endpoint. |
+| `mqttBaseTopic` | string | `kioskalator` | [planned](https://github.com/metaneutrons/Kioskalator/issues/8) | Topic prefix; the kiosk identifier is appended. |
+| `mqttCredentialReference` | string | none | [planned](https://github.com/metaneutrons/Kioskalator/issues/8) | Keychain reference for broker credentials. |
 
 ### Remote configuration
 
 | Key | Type | Default | Status | What it does |
 | --- | --- | --- | --- | --- |
-| `remoteConfigurationURL` | URL | none | planned | Where layer 2 is fetched from. |
-| `remoteConfigurationPublicKey` | string | none | planned | Ed25519 public key, base64. A remote configuration without a valid signature is discarded and the previous one is kept. |
-| `remoteConfigurationRefreshInterval` | seconds | `900` | planned | How often it is refetched. |
+| `remoteConfigurationURL` | URL | none | [planned](https://github.com/metaneutrons/Kioskalator/issues/4) | Where layer 2 is fetched from. |
+| `remoteConfigurationPublicKey` | string | none | [planned](https://github.com/metaneutrons/Kioskalator/issues/4) | Ed25519 public key, base64. A remote configuration without a valid signature is discarded and the previous one is kept. |
+| `remoteConfigurationRefreshInterval` | seconds | `900` | [planned](https://github.com/metaneutrons/Kioskalator/issues/4) | How often it is refetched. |
 
 `remoteConfigurationURL` without `remoteConfigurationPublicKey` is refused at
 load. An unsigned endpoint that can repoint the kiosk is a remote code path in
 everything but name, and making it optional means it would be optional in
 practice.
+
+## Not configuration, and not implemented either
+
+Three things the deployment model assumes and the code does not have yet. They
+are listed here because reading only the key table would suggest they exist.
+
+- **Automatic updates.** Sparkle is the chosen channel and none of it is built:
+  no framework, no EdDSA key, no appcast.
+  [#11](https://github.com/metaneutrons/Kioskalator/issues/11). An
+  auto-updating kiosk also needs a maintenance window, which will be a key here
+  once there is something to gate.
+- **A watchdog.** The kiosk presentation options hold while the application is
+  running and frontmost. Nothing currently brings it back after a crash.
+  [#12](https://github.com/metaneutrons/Kioskalator/issues/12).
+- **Touchscreen focus handling.** A focused field does not scroll clear of the
+  system accessibility keyboard, and that keyboard is not reachable from a
+  locked-down kiosk with no physical keyboard attached.
+  [#13](https://github.com/metaneutrons/Kioskalator/issues/13).
 
 ## What a kiosk cannot do
 

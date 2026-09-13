@@ -9,11 +9,12 @@ may go. It keeps the parts of a browser a form actually needs — text selection
 cut, copy, paste, select-all — and drops the parts a kiosk must not have.
 
 > **Status: pre-release.** The configuration model, the navigation policy and
-> the lockdown are implemented and tested. Several keys in
-> [docs/configuration.md](docs/configuration.md) are marked *planned* and say so
-> in the table; they are tracked as issues and are not silently absent. There is
-> no signed release yet, so the only supported route today is building from
-> source.
+> the lockdown are implemented and tested. Keys marked *planned* in
+> [docs/configuration.md](docs/configuration.md) link to the issue that tracks
+> them and are rejected as unknown until they land, so nothing is silently
+> absent. The settings pane is read-only, automatic updates and a watchdog do
+> not exist yet, and there is no signed release, so building from source is the
+> only supported route today.
 
 ## What it does
 
@@ -33,9 +34,13 @@ cut, copy, paste, select-all — and drops the parts a kiosk must not have.
   patterns are refused with a notice naming what was blocked. Subresources are
   left alone, so a page does not half-load.
 - **Locking that holds.** Any configuration layer can lock a key against every
-  layer below it, and managed preferences sit at the top. A locked field in the
-  settings pane is greyed and names the layer holding it, instead of appearing
-  to save and quietly not saving.
+  layer below it, and managed preferences sit at the top. A lower layer that
+  tries to set a locked key is refused, and the refusal is recorded and logged
+  rather than discarded, so a setting never appears to save and quietly does
+  not. The settings pane lists every key with its value, where that value came
+  from and which layer holds its lock; it is read-only for now, and
+  [#3](https://github.com/metaneutrons/Kioskalator/issues/3) is the editing
+  surface.
 - **An escape hatch that fails closed.** A configurable chord opens a passcode
   dialog; the passcode is stored as a PBKDF2 record, attempts are rate limited
   and logged, and with no passcode configured there is no way out rather than a
