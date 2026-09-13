@@ -1,0 +1,714 @@
+# The hardened release pipeline.
+#
+# It has NO tag trigger on purpose. release-please.yml dispatches it against the
+# tag it just created; a tag trigger here would run a second pipeline in
+# parallel on every release.
+name: Release
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  DEVELOPER_DIR: /Applications/Xcode_26.6.app/Contents/Developer
+  XCODE_VERSION: '26.6'
+  SCHEME: Kioskalator
+  XCODEGEN_VERSION: '2.46.0'
+  PAYLOAD_PREFIX: Kioskalator
+
+jobs:
+  # 1  Establish identity. Nothing public happens until the tag, the commit and
+  #    the shipped version agree.
+  metadata:
+    name: Identity
+    runs-on: ubuntu-24.04
+    outputs:
+      tag: ${{ steps.identity.outputs.tag }}
+      version: ${{ steps.identity.outputs.version }}
+      is_prerelease: ${{ steps.identity.outputs.is_prerelease }}
+      payload: ${{ steps.identity.outputs.payload }}
+      source_date_epoch: ${{ steps.identity.outputs.source_date_epoch }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: The tag, the commit and the shipped version have to agree
+        id: identity
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          case "$GITHUB_REF" in
+            refs/tags/*) : ;;
+            *) echo "::error::this pipeline runs against a tag, not $GITHUB_REF"; exit 1 ;;
+          esac
+
+          # Canonical SemVer with a leading v.
+          semver='^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$'
+          if ! printf '%s' "$TAG" | grep -Eq "$semver"; then
+            echo "::error::tag $TAG is not canonical SemVer"
+            exit 1
+          fi
+
+          # An annotated tag is not a precondition: release-please creates
+          # lightweight ones. What matters is that it points here.
+          pointed=$(git rev-parse "${TAG}^{}")
+          if [ "$pointed" != "$GITHUB_SHA" ]; then
+            echo "::error::tag $TAG points at $pointed, the run is on $GITHUB_SHA"
+            exit 1
+          fi
+
+          # The release core only. A prerelease suffix is by definition not in
+          # the manifest or the xcconfig.
+          version="${TAG#v}"
+          version="${version%%+*}"
+          core="${version%%-*}"
+
+          manifest=$(jq -r '."."' .release-please-manifest.json)
+          if [ "$manifest" != "$core" ]; then
+            echo "::error::release-please manifest says $manifest, the tag says $core"
+            exit 1
+          fi
+
+          marketing=$(awk -F'=' '/^MARKETING_VERSION/ {gsub(/[ \t]/,"",$2); sub(/\/\/.*/,"",$2); print $2}' \
+            Config/Version.xcconfig)
+          if [ "$marketing" != "$core" ]; then
+            echo "::error::Config/Version.xcconfig says $marketing, the tag says $core"
+            exit 1
+          fi
+
+          is_prerelease=false
+          case "$version" in *-*) is_prerelease=true ;; esac
+
+          {
+            echo "tag=$TAG"
+            echo "version=$core"
+            echo "is_prerelease=$is_prerelease"
+            echo "payload=${PAYLOAD_PREFIX}-${core}-macos-universal.zip"
+            echo "source_date_epoch=$(git log -1 --pretty=%ct)"
+          } >> "$GITHUB_OUTPUT"
+
+  # 2  Build, sign, notarize and staple, then check the result rather than
+  #    assume it.
+  build:
+    name: Build and notarize
+    needs: [metadata]
+    runs-on: macos-26
+    environment: release
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: The toolchain has to be the pinned one
+        run: |
+          set -euo pipefail
+          xcodebuild -version
+          test "$(xcodebuild -version | awk 'NR==1{print $2}')" = "$XCODE_VERSION"
+
+      - name: Generate the Xcode project from its spec
+        run: |
+          set -euo pipefail
+          curl -sSfL -o "$RUNNER_TEMP/xcodegen.zip" \
+            "https://github.com/yonaskolb/XcodeGen/releases/download/${XCODEGEN_VERSION}/xcodegen.zip"
+          unzip -q -o "$RUNNER_TEMP/xcodegen.zip" -d "$RUNNER_TEMP"
+          "$RUNNER_TEMP/xcodegen/bin/xcodegen" generate --quiet
+
+      - name: Seed the generated project with the committed lockfile
+        run: |
+          set -euo pipefail
+          seed=Kioskalator.xcodeproj/project.xcworkspace/xcshareddata/swiftpm
+          if [ -f Core/Package.resolved ]; then
+            mkdir -p "$seed"
+            cp Core/Package.resolved "$seed/Package.resolved"
+          elif [ -f "$seed/Package.resolved" ]; then
+            echo "::error::the project resolved packages but Core/Package.resolved is absent"
+            exit 1
+          fi
+
+      # Into a keychain of this job's own, never the runner's login keychain.
+      - name: Import the Developer ID certificate into a temporary keychain
+        env:
+          CERT_P12_BASE64: ${{ secrets.APPLE_CERT_P12_BASE64 }}
+          CERT_PASSWORD: ${{ secrets.APPLE_CERT_PASSWORD }}
+        run: |
+          set -euo pipefail
+          keychain="$RUNNER_TEMP/build.keychain-db"
+          password=$(uuidgen)
+          security create-keychain -p "$password" "$keychain"
+          security set-keychain-settings -lut 3600 "$keychain"
+          security unlock-keychain -p "$password" "$keychain"
+          (umask 077; printf '%s' "$CERT_P12_BASE64" | base64 --decode > "$RUNNER_TEMP/cert.p12")
+          security import "$RUNNER_TEMP/cert.p12" -k "$keychain" -P "$CERT_PASSWORD" \
+            -T /usr/bin/codesign -T /usr/bin/security
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$password" "$keychain"
+          rm -f "$RUNNER_TEMP/cert.p12"
+          # The existing search list is preserved as an array; unquoted command
+          # substitution here word-splits any keychain path containing a space.
+          existing=()
+          while IFS= read -r entry; do
+            existing+=("$(printf '%s' "$entry" | tr -d '" ')")
+          done < <(security list-keychains -d user)
+          security list-keychains -d user -s "$keychain" "${existing[@]}"
+          identity=$(security find-identity -v -p codesigning "$keychain" \
+            | awk '/Developer ID Application/ {print $2; exit}')
+          test -n "$identity" || { echo "::error::no Developer ID Application identity"; exit 1; }
+          echo "SIGN_IDENTITY=$identity" >> "$GITHUB_ENV"
+          echo "BUILD_KEYCHAIN=$keychain" >> "$GITHUB_ENV"
+
+      # The build number is derived from something monotonic and never set by
+      # hand: two builds sharing one are rejected on upload and confuse an
+      # update feed's comparison.
+      - name: Archive and export
+        env:
+          TEAM_ID: ${{ vars.APPLE_TEAM_ID }}
+          VERSION: ${{ needs.metadata.outputs.version }}
+        run: |
+          set -euo pipefail
+          cat > "$RUNNER_TEMP/ExportOptions.plist" <<PLIST
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>method</key><string>developer-id</string>
+            <key>destination</key><string>export</string>
+            <key>teamID</key><string>${TEAM_ID}</string>
+            <key>signingStyle</key><string>manual</string>
+          </dict>
+          </plist>
+          PLIST
+
+          # exportArchive is what applies the export options. A bundle copied by
+          # hand out of DerivedData skips that step while looking identical.
+          xcodebuild archive -quiet \
+            -scheme "$SCHEME" \
+            -destination 'generic/platform=macOS' \
+            -archivePath "$RUNNER_TEMP/Kioskalator.xcarchive" \
+            -onlyUsePackageVersionsFromResolvedFile \
+            ARCHS='arm64 x86_64' ONLY_ACTIVE_ARCH=NO \
+            CURRENT_PROJECT_VERSION="$GITHUB_RUN_NUMBER" \
+            CODE_SIGN_STYLE=Manual \
+            CODE_SIGN_IDENTITY="$SIGN_IDENTITY" \
+            DEVELOPMENT_TEAM="$TEAM_ID" \
+            OTHER_CODE_SIGN_FLAGS='--timestamp --options=runtime'
+
+          xcodebuild -exportArchive -quiet \
+            -archivePath "$RUNNER_TEMP/Kioskalator.xcarchive" \
+            -exportOptionsPlist "$RUNNER_TEMP/ExportOptions.plist" \
+            -exportPath "$RUNNER_TEMP/export"
+
+          app="$RUNNER_TEMP/export/Kioskalator.app"
+          test -d "$app" || { echo "::error::exportArchive produced no bundle"; exit 1; }
+          echo "APP=$app" >> "$GITHUB_ENV"
+
+      - name: The bundle has to be universal, hardened and self-contained
+        run: |
+          set -euo pipefail
+          binary="$APP/Contents/MacOS/Kioskalator"
+          lipo -info "$binary"
+          lipo -info "$binary" | grep -q 'x86_64' || { echo "::error::not universal"; exit 1; }
+          lipo -info "$binary" | grep -q 'arm64' || { echo "::error::not universal"; exit 1; }
+
+          codesign --verify --deep --strict --verbose=2 "$APP"
+          codesign -dvvv "$APP" 2>&1 | grep -q 'flags=0x10000(runtime)' \
+            || { echo "::error::the hardened runtime is not set"; exit 1; }
+
+          # A path from the build machine means the application fails to launch
+          # on a clean one rather than here.
+          if otool -L "$binary" | grep -Eq '/opt/homebrew|/usr/local|/Users/|/Volumes/'; then
+            otool -L "$binary"
+            echo "::error::the binary links against a path from the build machine"
+            exit 1
+          fi
+
+      - name: Notarize and staple
+        env:
+          API_KEY_ID: ${{ vars.APPLE_API_KEY }}
+          API_ISSUER: ${{ vars.APPLE_API_ISSUER }}
+          # Stored as the raw .p8 PEM, not base64, matching the other
+          # repositories that share this credential.
+          API_KEY_CONTENT: ${{ secrets.APPLE_API_KEY_CONTENT }}
+        run: |
+          set -euo pipefail
+          key="$RUNNER_TEMP/api.p8"
+          (umask 077; printf '%s' "$API_KEY_CONTENT" > "$key")
+          submission="$RUNNER_TEMP/submit.zip"
+          ditto -c -k --sequesterRsrc --keepParent "$APP" "$submission"
+
+          if ! xcrun notarytool submit "$submission" \
+            --key "$key" --key-id "$API_KEY_ID" --issuer "$API_ISSUER" \
+            --wait --timeout 30m --output-format json > "$RUNNER_TEMP/notary.json"; then
+            id=$(jq -r '.id // empty' "$RUNNER_TEMP/notary.json" || true)
+            [ -n "$id" ] && xcrun notarytool log "$id" \
+              --key "$key" --key-id "$API_KEY_ID" --issuer "$API_ISSUER" || true
+            rm -f "$key"
+            exit 1
+          fi
+          status=$(jq -r .status "$RUNNER_TEMP/notary.json")
+          if [ "$status" != "Accepted" ]; then
+            xcrun notarytool log "$(jq -r .id "$RUNNER_TEMP/notary.json")" \
+              --key "$key" --key-id "$API_KEY_ID" --issuer "$API_ISSUER" || true
+            rm -f "$key"
+            echo "::error::notarization returned $status"
+            exit 1
+          fi
+          rm -f "$key"
+
+          xcrun stapler staple "$APP"
+          xcrun stapler validate "$APP"
+
+      # The counter-probe for the whole signing chain: a quarantined copy on a
+      # machine that did not build it is what a user actually gets.
+      - name: Gatekeeper has to accept a quarantined copy
+        env:
+          PAYLOAD: ${{ needs.metadata.outputs.payload }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          ditto -c -k --sequesterRsrc --keepParent "$APP" "dist/$PAYLOAD"
+
+          clean="$RUNNER_TEMP/clean"
+          rm -rf "$clean" && mkdir -p "$clean"
+          ditto -x -k "dist/$PAYLOAD" "$clean"
+          xattr -w com.apple.quarantine '0081;00000000;Safari;' "$clean/Kioskalator.app"
+          spctl --assess --type execute --verbose=4 "$clean/Kioskalator.app" 2>&1 | tee "$RUNNER_TEMP/spctl.txt"
+          grep -q 'source=Notarized Developer ID' "$RUNNER_TEMP/spctl.txt" \
+            || { echo "::error::Gatekeeper did not accept the notarized copy"; exit 1; }
+
+      - name: Destroy the temporary keychain
+        if: always()
+        run: security delete-keychain "$BUILD_KEYCHAIN" || true
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: payload
+          path: dist/${{ needs.metadata.outputs.payload }}
+          if-no-files-found: error
+          retention-days: 7
+
+  # 3  Sign and attest. Only the payload gets a cosign bundle; the SBOM is
+  #    covered by SHA256SUMS and attested along with it.
+  attest:
+    name: Sign and attest
+    needs: [metadata, build]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: payload
+          path: dist
+
+      - uses: anchore/sbom-action@3ad7283483fc7af8ff2b4ea19663c2d5ca935e26 # v0.24.2
+        with:
+          # The SBOM keeps the FULL name of its payload, extension included.
+          # Dropping the .zip makes two payloads collide the moment a second
+          # archive format appears.
+          file: dist/${{ needs.metadata.outputs.payload }}
+          format: spdx-json
+          output-file: dist/${{ needs.metadata.outputs.payload }}.spdx.json
+          upload-artifact: false
+          upload-release-assets: false
+
+      - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+
+      - name: Sign the payload keylessly
+        env:
+          PAYLOAD: ${{ needs.metadata.outputs.payload }}
+        run: |
+          set -euo pipefail
+          cosign sign-blob --yes \
+            --bundle "dist/${PAYLOAD}.sigstore.json" \
+            "dist/${PAYLOAD}"
+          test -s "dist/${PAYLOAD}.sigstore.json"
+
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: dist/${{ needs.metadata.outputs.payload }}
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: candidate
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 7
+
+  # 5  The final candidate. Its expected asset list is formed here, once, and no
+  #    later stage may add to the release or change what is on it.
+  candidate:
+    name: Candidate inventory
+    needs: [metadata, attest]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: candidate
+          path: dist
+
+      - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+
+      - name: Verify the signature before anything is built on top of it
+        env:
+          PAYLOAD: ${{ needs.metadata.outputs.payload }}
+        run: |
+          set -euo pipefail
+          cosign verify-blob \
+            --bundle "dist/${PAYLOAD}.sigstore.json" \
+            --certificate-identity-regexp "^https://github.com/${GITHUB_REPOSITORY}/" \
+            --certificate-oidc-issuer 'https://token.actions.githubusercontent.com' \
+            "dist/${PAYLOAD}"
+
+      - name: The attestation has to verify against these bytes
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PAYLOAD: ${{ needs.metadata.outputs.payload }}
+        run: |
+          set -euo pipefail
+          gh attestation verify "dist/${PAYLOAD}" --repo "$GITHUB_REPOSITORY"
+
+      - name: Generate the Homebrew cask from the qualified payload
+        env:
+          PAYLOAD: ${{ needs.metadata.outputs.payload }}
+          TAG: ${{ needs.metadata.outputs.tag }}
+          VERSION: ${{ needs.metadata.outputs.version }}
+        run: |
+          set -euo pipefail
+          sha=$(sha256sum "dist/${PAYLOAD}" | awk '{print $1}')
+          cat > dist/kioskalator.rb <<CASK
+          cask "kioskalator" do
+            version "${VERSION}"
+            sha256 "${sha}"
+
+            url "https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG}/${PAYLOAD}"
+            name "Kioskalator"
+            desc "Configurable, lockable WebKit kiosk browser for macOS"
+            homepage "https://github.com/${GITHUB_REPOSITORY}"
+
+            depends_on macos: ">= :tahoe"
+
+            app "Kioskalator.app"
+
+            zap trash: [
+              "~/Library/Application Support/Kioskalator",
+              "~/Library/Preferences/com.metaneutrons.kioskalator.plist",
+              "~/Library/Saved Application State/com.metaneutrons.kioskalator.savedState",
+              "~/Library/WebKit/com.metaneutrons.kioskalator",
+            ]
+          end
+          CASK
+          ruby -c dist/kioskalator.rb
+          # Exactly one release URL, and it has to be this tag's. A cask that
+          # kept a previous tag's URL installs the previous version under the
+          # new name, and nothing about it looks wrong.
+          urls=$(grep -c "releases/download/${TAG}/" dist/kioskalator.rb)
+          test "$urls" -eq 1 || { echo "::error::expected 1 release URL, found $urls"; exit 1; }
+
+      - name: Sign the cask
+        run: |
+          set -euo pipefail
+          cosign sign-blob --yes --bundle dist/kioskalator.rb.sigstore.json dist/kioskalator.rb
+
+      # The expected set is derived from the payload list and the configured
+      # channel outputs, not maintained as a second constant that can disagree.
+      - name: The candidate has to be exactly what was planned
+        env:
+          PAYLOAD: ${{ needs.metadata.outputs.payload }}
+        run: |
+          set -euo pipefail
+          expected=$(printf '%s\n' \
+            "$PAYLOAD" \
+            "${PAYLOAD}.spdx.json" \
+            "${PAYLOAD}.sigstore.json" \
+            'kioskalator.rb' \
+            'kioskalator.rb.sigstore.json' | sort)
+          actual=$(cd dist && find . -maxdepth 1 -type f -printf '%f\n' | sort)
+          if [ "$expected" != "$actual" ]; then
+            echo "::error::the candidate inventory does not match"
+            diff <(printf '%s\n' "$expected") <(printf '%s\n' "$actual") || true
+            exit 1
+          fi
+          # NUL-separated into xargs: a filename is never re-split by the shell.
+          cd dist
+          printf '%s\n' "$expected" | tr '\n' '\0' | xargs -0 sha256sum > SHA256SUMS
+          sha256sum -c SHA256SUMS
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 7
+
+  # 6  Pre-check the package channels. Nothing is changed here; the point is to
+  #    fail before a public mutation rather than halfway through one.
+  #
+  #    Deliberately skipped for a prerelease tag, which never reaches stage 8
+  #    and therefore needs no channel access.
+  preflight:
+    name: Channel preflight
+    needs: [metadata]
+    if: ${{ needs.metadata.outputs.is_prerelease == 'false' }}
+    runs-on: ubuntu-24.04
+    environment: release
+    steps:
+      - name: The Homebrew app has to reach the tap and nothing else
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        id: tap-token
+        with:
+          client-id: ${{ vars.HOMEBREW_APP_CLIENT_ID }}
+          private-key: ${{ secrets.HOMEBREW_APP_PRIVATE_KEY }}
+          owner: metaneutrons
+          repositories: homebrew-tap
+          permission-contents: write
+          permission-pull-requests: write
+
+      - name: The issued token must see the tap and only the tap
+        env:
+          GH_TOKEN: ${{ steps.tap-token.outputs.token }}
+          TAP_REPO: ${{ vars.HOMEBREW_TAP_REPO }}
+        run: |
+          set -euo pipefail
+          test -n "$TAP_REPO"
+          # The installation-repositories endpoint is the App's actual grant. A
+          # repository's user-role permissions.push flag is not.
+          reachable=$(gh api /installation/repositories --jq '.repositories[].full_name' | sort)
+          echo "$reachable"
+          if [ "$reachable" != "$TAP_REPO" ]; then
+            echo "::error::the tap token reaches more than $TAP_REPO"
+            exit 1
+          fi
+
+  # 7  Staged prerelease. release-please has already created the tag and a
+  #    DRAFT release; a published release under this tag means the pipeline
+  #    would be changing something that has already shipped.
+  stage:
+    name: Stage the release
+    needs: [metadata, candidate, preflight]
+    if: >-
+      !cancelled()
+      && needs.metadata.result == 'success'
+      && needs.candidate.result == 'success'
+      && (
+        (needs.metadata.outputs.is_prerelease == 'true'
+          && needs.preflight.result == 'skipped')
+        || (needs.metadata.outputs.is_prerelease == 'false'
+          && needs.preflight.result == 'success')
+      )
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      id-token: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: release
+          path: dist
+
+      - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+
+      - name: Attach the assets to the draft
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.metadata.outputs.tag }}
+        run: |
+          set -euo pipefail
+          state=$(gh release view "$TAG" --json isDraft --jq .isDraft 2>/dev/null || echo absent)
+          case "$state" in
+            absent) gh release create "$TAG" --draft --verify-tag --title "$TAG" --notes 'Pipeline test tag.' ;;
+            true)   : ;;
+            false)  echo "::error::release $TAG is already published"; exit 1 ;;
+          esac
+          gh release upload "$TAG" dist/* --clobber
+
+      # Read back what the release actually serves, not what was uploaded.
+      - name: What the release serves has to be what was qualified
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.metadata.outputs.tag }}
+          PAYLOAD: ${{ needs.metadata.outputs.payload }}
+        run: |
+          set -euo pipefail
+          rm -rf verify && mkdir -p verify
+          gh release download "$TAG" --dir verify --pattern '*'
+
+          expected=$(cd dist && find . -maxdepth 1 -type f -printf '%f\n' | sort)
+          actual=$(cd verify && find . -maxdepth 1 -type f -printf '%f\n' | sort)
+          if [ "$expected" != "$actual" ]; then
+            echo "::error::the release inventory does not match the candidate"
+            diff <(printf '%s\n' "$expected") <(printf '%s\n' "$actual") || true
+            exit 1
+          fi
+
+          # The checksum file must describe every other asset, exactly.
+          listed=$(awk '{print $2}' verify/SHA256SUMS | sort)
+          planned=$(printf '%s\n' "$expected" | grep -v '^SHA256SUMS$' | sort)
+          if [ "$listed" != "$planned" ]; then
+            echo "::error::SHA256SUMS does not describe the release inventory"
+            diff <(printf '%s\n' "$planned") <(printf '%s\n' "$listed") || true
+            exit 1
+          fi
+          (cd verify && sha256sum -c SHA256SUMS)
+
+          cosign verify-blob \
+            --bundle "verify/${PAYLOAD}.sigstore.json" \
+            --certificate-identity-regexp "^https://github.com/${GITHUB_REPOSITORY}/" \
+            --certificate-oidc-issuer 'https://token.actions.githubusercontent.com' \
+            "verify/${PAYLOAD}"
+          gh attestation verify "verify/${PAYLOAD}" --repo "$GITHUB_REPOSITORY"
+
+      - name: Make it visible as a prerelease, never as latest
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.metadata.outputs.tag }}
+        run: |
+          set -euo pipefail
+          gh release edit "$TAG" --draft=false --prerelease --latest=false
+
+  # 8  Publish the channels, and verify each against the public source after
+  #    publication. A prerelease never gets here.
+  publish-homebrew:
+    name: Homebrew cask
+    needs: [metadata, preflight, stage]
+    if: ${{ needs.metadata.outputs.is_prerelease == 'false' }}
+    runs-on: ubuntu-24.04
+    environment: release
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: release
+          path: dist
+
+      # Minted immediately before use, scoped to the tap, and revoked when the
+      # job ends including on failure.
+      - uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        id: tap-token
+        with:
+          client-id: ${{ vars.HOMEBREW_APP_CLIENT_ID }}
+          private-key: ${{ secrets.HOMEBREW_APP_PRIVATE_KEY }}
+          owner: metaneutrons
+          repositories: homebrew-tap
+          permission-contents: write
+          permission-pull-requests: write
+
+      - name: Open a pull request against the tap
+        id: tap-pr
+        env:
+          GH_TOKEN: ${{ steps.tap-token.outputs.token }}
+          TAP_REPO: ${{ vars.HOMEBREW_TAP_REPO }}
+          TAG: ${{ needs.metadata.outputs.tag }}
+          VERSION: ${{ needs.metadata.outputs.version }}
+        run: |
+          set -euo pipefail
+          bot=$(gh api "/users/${{ steps.tap-token.outputs.app-slug }}[bot]" \
+            --jq '"\(.id) \(.login)"')
+          bot_id=${bot%% *}
+          bot_login=${bot#* }
+
+          git clone "https://x-access-token:${GH_TOKEN}@github.com/${TAP_REPO}.git" tap
+          cd tap
+          mkdir -p Casks
+          cp ../dist/kioskalator.rb Casks/kioskalator.rb
+
+          # Nothing to do is a legitimate outcome, not a failure: a re-run of the
+          # same tag must not open an empty pull request.
+          if git diff --quiet -- Casks/kioskalator.rb; then
+            echo "the tap already carries this cask"
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          branch="kioskalator-${VERSION}"
+          git config user.name "$bot_login"
+          git config user.email "${bot_id}+${bot_login}@users.noreply.github.com"
+          git checkout -b "$branch"
+          git add Casks/kioskalator.rb
+          git commit -m "feat(kioskalator): update to ${VERSION}"
+          git push origin "$branch"
+          url=$(gh pr create --repo "$TAP_REPO" --head "$branch" --base main \
+            --title "feat(kioskalator): update to ${VERSION}" \
+            --body "Generated by the Kioskalator release pipeline for ${TAG}.")
+          {
+            echo "changed=true"
+            echo "branch=$branch"
+            echo "pr=$url"
+          } >> "$GITHUB_OUTPUT"
+
+      # `gh pr checks` fails with "no checks reported" when the tap has not
+      # registered a check run yet, and the pull request is seconds old here.
+      # --watch does not wait that out, so the first check is waited for
+      # explicitly, with a deadline and a hard failure at the end of it.
+      - name: Wait for the tap to qualify the cask, then merge
+        if: ${{ steps.tap-pr.outputs.changed == 'true' }}
+        env:
+          GH_TOKEN: ${{ steps.tap-token.outputs.token }}
+          TAP_REPO: ${{ vars.HOMEBREW_TAP_REPO }}
+          PR: ${{ steps.tap-pr.outputs.pr }}
+        run: |
+          set -euo pipefail
+          deadline=$(( $(date +%s) + 900 ))
+          delay=5
+          until gh pr checks "$PR" --repo "$TAP_REPO" >/dev/null 2>&1; do
+            if [ "$(date +%s)" -ge "$deadline" ]; then
+              echo "::error::the tap reported no check within the deadline"
+              exit 1
+            fi
+            sleep "$delay"
+            delay=$(( delay < 60 ? delay * 2 : 60 ))
+          done
+          gh pr checks "$PR" --repo "$TAP_REPO" --watch --fail-fast
+          gh pr merge "$PR" --repo "$TAP_REPO" --squash --delete-branch
+
+      - name: Read the published formula back, byte for byte
+        if: ${{ steps.tap-pr.outputs.changed == 'true' }}
+        env:
+          GH_TOKEN: ${{ steps.tap-token.outputs.token }}
+          TAP_REPO: ${{ vars.HOMEBREW_TAP_REPO }}
+        run: |
+          set -euo pipefail
+          # cmp on two files, never through $(...): command substitution strips
+          # the trailing newline from the side that passes through it while the
+          # file on disk keeps its own, so such a comparison fails by exactly
+          # one byte on every run and the gate can never pass.
+          gh api "repos/${TAP_REPO}/contents/Casks/kioskalator.rb" \
+            --jq '.content' | base64 -d > published.rb
+          cmp published.rb dist/kioskalator.rb
+
+  # 9  Promote. Only once every configured channel has succeeded. The assets are
+  #    not touched.
+  promote:
+    name: Promote to latest
+    needs: [metadata, stage, publish-homebrew]
+    if: >-
+      !cancelled()
+      && needs.metadata.outputs.is_prerelease == 'false'
+      && needs.stage.result == 'success'
+      && needs.publish-homebrew.result == 'success'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - name: The unchanged prerelease becomes the latest release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.metadata.outputs.tag }}
+        run: |
+          set -euo pipefail
+          gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --prerelease=false --latest
+          state=$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" \
+            --json isPrerelease,isLatest --jq '"\(.isPrerelease) \(.isLatest)"')
+          test "$state" = "false true" || { echo "::error::promote did not take: $state"; exit 1; }
